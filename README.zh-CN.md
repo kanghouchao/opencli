@@ -9,7 +9,7 @@
 [![Node.js Version](https://img.shields.io/node/v/@jackwener/opencli?style=flat-square)](https://nodejs.org)
 [![License](https://img.shields.io/npm/l/@jackwener/opencli?style=flat-square)](./LICENSE)
 
-OpenCLI 通过 Chrome 浏览器 + [Playwright MCP Bridge](https://github.com/nichochar/playwright-mcp) 扩展，将任何网站变成命令行工具。57个内置命令。不存密码、不泄 token，直接复用浏览器已登录状态。
+OpenCLI 将任何网站变成命令行工具。**57 个命令**覆盖 **17 个站点** — B站、知乎、小红书、Twitter、Reddit、雪球、GitHub、V2EX、Hacker News、BBC、微博、BOSS直聘、Yahoo Finance、路透社、什么值得买、携程、YouTube — 复用浏览器登录态，AI 驱动探索。
 
 ---
 
