@@ -27,6 +27,22 @@ const MAX_IMAGES = 9;
 const MAX_TITLE_LEN = 20;
 const UPLOAD_SETTLE_MS = 3000;
 
+/** Selectors for the title field, ordered by priority (new UI first). */
+const TITLE_SELECTORS = [
+  // New creator center (2026-03) uses contenteditable for the title field.
+  // Placeholder observed: "填写标题会有更多赞哦"
+  '[contenteditable="true"][placeholder*="标题"]',
+  '[contenteditable="true"][placeholder*="赞"]',
+  '[contenteditable="true"][class*="title"]',
+  'input[maxlength="20"]',
+  'input[class*="title"]',
+  'input[placeholder*="标题"]',
+  'input[placeholder*="title" i]',
+  '.title-input input',
+  '.note-title input',
+  'input[maxlength]',
+];
+
 type ImagePayload = { name: string; mimeType: string; base64: string };
 
 /**
@@ -63,14 +79,22 @@ async function injectImages(page: IPage, images: ImagePayload[]): Promise<{ ok: 
     (async () => {
       const images = ${payload};
 
-      // Prefer image/* file inputs; fall back to the first available input.
+      // Only use image-capable file inputs. Do not fall back to a generic uploader,
+      // otherwise we can accidentally feed images into the video upload flow.
       const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
       const input = inputs.find(el => {
         const accept = el.getAttribute('accept') || '';
-        return accept.includes('image') || accept.includes('.jpg') || accept.includes('.png');
-      }) || inputs[0];
+        return (
+          accept.includes('image') ||
+          accept.includes('.jpg') ||
+          accept.includes('.jpeg') ||
+          accept.includes('.png') ||
+          accept.includes('.gif') ||
+          accept.includes('.webp')
+        );
+      });
 
-      if (!input) return { ok: false, count: 0, error: 'No file input found on page' };
+      if (!input) return { ok: false, count: 0, error: 'No image file input found on page' };
 
       const dt = new DataTransfer();
       for (const img of images) {
@@ -151,6 +175,139 @@ async function fillField(page: IPage, selectors: string[], text: string, fieldNa
   }
 }
 
+async function selectImageTextTab(
+  page: IPage,
+): Promise<{ ok: boolean; target?: string; text?: string; visibleTexts?: string[] }> {
+  const result = await page.evaluate(`
+    () => {
+      const isVisible = (el) => {
+        if (!el || el.offsetParent === null) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+      const selector = 'button, [role="tab"], [role="button"], a, label, div, span, li';
+      const nodes = Array.from(document.querySelectorAll(selector));
+      const targets = ['上传图文', '图文', '图片'];
+
+      for (const target of targets) {
+        for (const node of nodes) {
+          if (!isVisible(node)) continue;
+          const text = normalize(node.innerText || node.textContent || '');
+          if (!text || text.includes('视频')) continue;
+          if (text === target || text.startsWith(target) || text.includes(target)) {
+            const clickable = node.closest('button, [role="tab"], [role="button"], a, label') || node;
+            clickable.click();
+            return { ok: true, target, text };
+          }
+        }
+      }
+
+      const visibleTexts = [];
+      for (const node of nodes) {
+        if (!isVisible(node)) continue;
+        const text = normalize(node.innerText || node.textContent || '');
+        if (!text || text.length > 20) continue;
+        visibleTexts.push(text);
+        if (visibleTexts.length >= 20) break;
+      }
+      return { ok: false, visibleTexts };
+    }
+  `);
+  if (result?.ok) {
+    await page.wait({ time: 1 });
+  }
+  return result;
+}
+
+type PublishSurfaceState = 'video_surface' | 'image_surface' | 'editor_ready';
+
+type PublishSurfaceInspection = {
+  state: PublishSurfaceState;
+  hasTitleInput: boolean;
+  hasImageInput: boolean;
+  hasVideoSurface: boolean;
+};
+
+async function inspectPublishSurfaceState(page: IPage): Promise<PublishSurfaceInspection> {
+  return page.evaluate(`
+    () => {
+      const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      const hasTitleInput = !!Array.from(document.querySelectorAll('input, textarea')).find((el) => {
+        if (!el || el.offsetParent === null) return false;
+        const placeholder = (el.getAttribute('placeholder') || '').trim();
+        const cls = el.className ? String(el.className) : '';
+        const maxLength = Number(el.getAttribute('maxlength') || 0);
+        return (
+          placeholder.includes('标题') ||
+          /title/i.test(placeholder) ||
+          /title/i.test(cls) ||
+          maxLength === 20
+        );
+      });
+      const hasImageInput = !!Array.from(document.querySelectorAll('input[type="file"]')).find((el) => {
+        const accept = el.getAttribute('accept') || '';
+        return (
+          accept.includes('image') ||
+          accept.includes('.jpg') ||
+          accept.includes('.jpeg') ||
+          accept.includes('.png') ||
+          accept.includes('.gif') ||
+          accept.includes('.webp')
+        );
+      });
+      const hasVideoSurface = text.includes('拖拽视频到此处点击上传') || text.includes('上传视频');
+      const state = hasTitleInput ? 'editor_ready' : hasImageInput || !hasVideoSurface ? 'image_surface' : 'video_surface';
+      return { state, hasTitleInput, hasImageInput, hasVideoSurface };
+    }
+  `);
+}
+
+async function waitForPublishSurfaceState(
+  page: IPage,
+  maxWaitMs = 5_000,
+): Promise<PublishSurfaceInspection> {
+  const pollMs = 500;
+  const maxAttempts = Math.max(1, Math.ceil(maxWaitMs / pollMs));
+  let surface = await inspectPublishSurfaceState(page);
+
+  for (let i = 0; i < maxAttempts; i++) {
+    if (surface.state !== 'video_surface') {
+      return surface;
+    }
+    if (i < maxAttempts - 1) {
+      await page.wait({ time: pollMs / 1_000 });
+      surface = await inspectPublishSurfaceState(page);
+    }
+  }
+
+  return surface;
+}
+
+/**
+ * Poll until the title/content editing form appears on the page.
+ * The new creator center UI only renders the editor after images are uploaded.
+ */
+async function waitForEditForm(page: IPage, maxWaitMs = 10_000): Promise<boolean> {
+  const pollMs = 1_000;
+  const maxAttempts = Math.ceil(maxWaitMs / pollMs);
+  for (let i = 0; i < maxAttempts; i++) {
+    const found: boolean = await page.evaluate(`
+      (() => {
+        const sels = ${JSON.stringify(TITLE_SELECTORS)};
+        for (const sel of sels) {
+          const el = document.querySelector(sel);
+          if (el && el.offsetParent !== null) return true;
+        }
+        return false;
+      })()`);
+    if (found) return true;
+    if (i < maxAttempts - 1) await page.wait({ time: pollMs / 1_000 });
+  }
+  return false;
+}
+
 cli({
   site: 'xiaohongshu',
   name: 'publish',
@@ -161,7 +318,7 @@ cli({
   args: [
     { name: 'title', required: true, help: '笔记标题 (最多20字)' },
     { name: 'content', required: true, positional: true, help: '笔记正文' },
-    { name: 'images', required: false, help: '图片路径，逗号分隔，最多9张 (jpg/png/gif/webp)' },
+    { name: 'images', required: true, help: '图片路径，逗号分隔，最多9张 (jpg/png/gif/webp)' },
     { name: 'topics', required: false, help: '话题标签，逗号分隔，不含 # 号' },
     { name: 'draft', type: 'bool', default: false, help: '保存为草稿，不直接发布' },
   ],
@@ -184,6 +341,8 @@ cli({
     if (title.length > MAX_TITLE_LEN)
       throw new Error(`Title is ${title.length} chars — must be ≤ ${MAX_TITLE_LEN}`);
     if (!content) throw new Error('Positional argument <content> is required');
+    if (imagePaths.length === 0)
+      throw new Error('At least one --images path is required. The creator center now requires images before showing the editor.');
     if (imagePaths.length > MAX_IMAGES)
       throw new Error(`Too many images: ${imagePaths.length} (max ${MAX_IMAGES})`);
 
@@ -204,51 +363,44 @@ cli({
     }
 
     // ── Step 2: Select 图文 (image+text) note type if tabs are present ─────────
-    const tabClicked: boolean = await page.evaluate(`
-      () => {
-        const allEls = document.querySelectorAll('[class*="tab"], [class*="note-type"], [class*="type-item"]');
-        for (const el of allEls) {
-          const text = el.innerText || el.textContent || '';
-          if ((text.includes('图文') || text.includes('图片')) && el.offsetParent !== null) {
-            el.click();
-            return true;
-          }
-        }
-        return false;
-      }
-    `);
-    if (tabClicked) await page.wait({ time: 1 });
+    const tabResult = await selectImageTextTab(page);
+    const surface = await waitForPublishSurfaceState(page, tabResult?.ok ? 5_000 : 2_000);
+    if (surface.state === 'video_surface') {
+      await page.screenshot({ path: '/tmp/xhs_publish_tab_debug.png' });
+      const detail = tabResult?.ok
+        ? `clicked "${tabResult.text}"`
+        : `visible candidates: ${(tabResult?.visibleTexts || []).join(' | ') || 'none'}`;
+      throw new Error(
+        'Still on the video publish page after trying to select 图文. ' +
+        `Details: ${detail}. Debug screenshot: /tmp/xhs_publish_tab_debug.png`
+      );
+    }
 
     // ── Step 3: Upload images ──────────────────────────────────────────────────
-    if (imageData.length > 0) {
-      const upload = await injectImages(page, imageData);
-      if (!upload.ok) {
-        await page.screenshot({ path: '/tmp/xhs_publish_upload_debug.png' });
-        throw new Error(
-          `Image injection failed: ${upload.error ?? 'unknown'}. ` +
-          'Debug screenshot: /tmp/xhs_publish_upload_debug.png'
-        );
-      }
-      // Allow XHS to process and upload images to its CDN
-      await page.wait({ time: UPLOAD_SETTLE_MS / 1_000 });
-      await waitForUploads(page);
+    const upload = await injectImages(page, imageData);
+    if (!upload.ok) {
+      await page.screenshot({ path: '/tmp/xhs_publish_upload_debug.png' });
+      throw new Error(
+        `Image injection failed: ${upload.error ?? 'unknown'}. ` +
+        'Debug screenshot: /tmp/xhs_publish_upload_debug.png'
+      );
+    }
+    // Allow XHS to process and upload images to its CDN
+    await page.wait({ time: UPLOAD_SETTLE_MS / 1_000 });
+    await waitForUploads(page);
+
+    // ── Step 3b: Wait for editor form to render ───────────────────────────────
+    const formReady = await waitForEditForm(page);
+    if (!formReady) {
+      await page.screenshot({ path: '/tmp/xhs_publish_form_debug.png' });
+      throw new Error(
+        'Editing form did not appear after image upload. The page layout may have changed. ' +
+        'Debug screenshot: /tmp/xhs_publish_form_debug.png'
+      );
     }
 
     // ── Step 4: Fill title ─────────────────────────────────────────────────────
-    await fillField(
-      page,
-      [
-        'input[maxlength="20"]',
-        'input[class*="title"]',
-        'input[placeholder*="标题"]',
-        'input[placeholder*="title" i]',
-        '.title-input input',
-        '.note-title input',
-        'input[maxlength]',
-      ],
-      title,
-      'title'
-    );
+    await fillField(page, TITLE_SELECTORS, title, 'title');
     await page.wait({ time: 0.5 });
 
     // ── Step 5: Fill content / body ────────────────────────────────────────────
@@ -263,7 +415,7 @@ cli({
         '.note-content [contenteditable="true"]',
         '.editor-content [contenteditable="true"]',
         // Broad fallback — last resort; filter out any title contenteditable
-        '[contenteditable="true"]:not([placeholder*="标题"]):not([placeholder*="title" i])',
+        '[contenteditable="true"]:not([placeholder*="标题"]):not([placeholder*="赞"]):not([placeholder*="title" i])',
       ],
       content,
       'content'
@@ -327,14 +479,14 @@ cli({
     }
 
     // ── Step 7: Publish or save draft ─────────────────────────────────────────
-    const actionLabel = isDraft ? '存草稿' : '发布';
+    const actionLabels = isDraft ? ['暂存离开', '存草稿'] : ['发布', '发布笔记'];
     const btnClicked: boolean = await page.evaluate(`
-      (label => {
+      (labels => {
         const buttons = document.querySelectorAll('button, [role="button"]');
         for (const btn of buttons) {
           const text = (btn.innerText || btn.textContent || '').trim();
           if (
-            (text === label || text.includes(label) || text === '发布笔记') &&
+            labels.some(l => text === l || text.includes(l)) &&
             btn.offsetParent !== null &&
             !btn.disabled
           ) {
@@ -343,13 +495,13 @@ cli({
           }
         }
         return false;
-      })(${JSON.stringify(actionLabel)})
+      })(${JSON.stringify(actionLabels)})
     `);
 
     if (!btnClicked) {
       await page.screenshot({ path: '/tmp/xhs_publish_submit_debug.png' });
       throw new Error(
-        `Could not find "${actionLabel}" button. ` +
+        `Could not find "${actionLabels[0]}" button. ` +
         'Debug screenshot: /tmp/xhs_publish_submit_debug.png'
       );
     }
@@ -364,7 +516,7 @@ cli({
           const text = (el.innerText || '').trim();
           if (
             el.children.length === 0 &&
-            (text.includes('发布成功') || text.includes('草稿已保存') || text.includes('上传成功'))
+            (text.includes('发布成功') || text.includes('草稿已保存') || text.includes('暂存成功') || text.includes('上传成功'))
           ) return text;
         }
         return '';
@@ -373,14 +525,14 @@ cli({
 
     const navigatedAway = !finalUrl.includes('/publish/publish');
     const isSuccess = successMsg.length > 0 || navigatedAway;
-    const verb = isDraft ? '草稿已保存' : '发布成功';
+    const verb = isDraft ? '暂存成功' : '发布成功';
 
     return [
       {
         status: isSuccess ? `✅ ${verb}` : '⚠️ 操作完成，请在浏览器中确认',
         detail: [
           `"${title}"`,
-          imageData.length ? `${imageData.length}张图片` : '无图',
+          `${imageData.length}张图片`,
           topics.length ? `话题: ${topics.join(' ')}` : '',
           successMsg || finalUrl || '',
         ]

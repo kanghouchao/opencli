@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { IPage } from '../types.js';
+import type { IBrowserFactory } from '../runtime.js';
 import { Page } from './page.js';
 import { isDaemonRunning, isExtensionConnected } from './daemon-client.js';
 import { DEFAULT_DAEMON_PORT } from '../constants.js';
@@ -18,7 +19,7 @@ export type BrowserBridgeState = 'idle' | 'connecting' | 'connected' | 'closing'
 /**
  * Browser factory: manages daemon lifecycle and provides IPage instances.
  */
-export class BrowserBridge {
+export class BrowserBridge implements IBrowserFactory {
   private _state: BrowserBridgeState = 'idle';
   private _page: Page | null = null;
   private _daemonProc: ChildProcess | null = null;
@@ -95,10 +96,11 @@ export class BrowserBridge {
     });
     this._daemonProc.unref();
 
-    // Wait for daemon to be ready AND extension to connect
+    // Wait for daemon to be ready AND extension to connect (exponential backoff)
+    const backoffs = [50, 100, 200, 400, 800, 1500, 3000];
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 300));
+    for (let i = 0; Date.now() < deadline; i++) {
+      await new Promise(resolve => setTimeout(resolve, backoffs[Math.min(i, backoffs.length - 1)]));
       if (await isExtensionConnected()) return;
     }
 

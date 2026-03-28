@@ -16,11 +16,7 @@ export default defineConfig({
       {
         test: {
           name: 'adapter',
-          include: [
-            'src/clis/bilibili/**/*.test.ts',
-            'src/clis/zhihu/**/*.test.ts',
-            'src/clis/v2ex/**/*.test.ts',
-          ],
+          include: ['src/clis/**/*.test.ts'],
           sequence: { groupOrder: 1 },
         },
       },

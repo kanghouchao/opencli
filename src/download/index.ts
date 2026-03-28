@@ -5,14 +5,16 @@
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as https from 'node:https';
-import * as http from 'node:http';
 import * as os from 'node:os';
+import { Readable, Transform } from 'node:stream';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
+import { pipeline } from 'node:stream/promises';
 import { URL } from 'node:url';
 import type { ProgressBar } from './progress.js';
 import { isBinaryInstalled } from '../external.js';
 import type { BrowserCookie } from '../types.js';
 import { getErrorMessage } from '../errors.js';
+import { fetchWithNodeNetwork } from '../node-network.js';
 
 export type { BrowserCookie } from '../types.js';
 
@@ -87,9 +89,6 @@ export async function httpDownload(
   const { cookies, headers = {}, timeout = 30000, onProgress, maxRedirects = 10 } = options;
 
   return new Promise((resolve) => {
-    const parsedUrl = new URL(url);
-    const protocol = parsedUrl.protocol === 'https:' ? https : http;
-
     const requestHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
       ...headers,
@@ -99,75 +98,97 @@ export async function httpDownload(
       requestHeaders['Cookie'] = cookies;
     }
 
-    // Ensure directory exists
-    const dir = path.dirname(destPath);
-    fs.mkdirSync(dir, { recursive: true });
-
     const tempPath = `${destPath}.tmp`;
-    const file = fs.createWriteStream(tempPath);
+    let settled = false;
 
-    const request = protocol.get(url, { headers: requestHeaders, timeout }, (response) => {
-      // Handle redirects
-      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        file.close();
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-        if (redirectCount >= maxRedirects) {
-          resolve({ success: false, size: 0, error: `Too many redirects (> ${maxRedirects})` });
+    const finish = (result: { success: boolean; size: number; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    const cleanupTempFile = async () => {
+      try {
+        await fs.promises.rm(tempPath, { force: true });
+      } catch {
+        // Ignore cleanup errors so the original failure is preserved.
+      }
+    };
+
+    void (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetchWithNodeNetwork(url, {
+          headers: requestHeaders,
+          signal: controller.signal,
+          redirect: 'manual',
+        });
+        clearTimeout(timer);
+
+        // Handle redirects before creating any file handles.
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location');
+          if (location) {
+            if (redirectCount >= maxRedirects) {
+              finish({ success: false, size: 0, error: `Too many redirects (> ${maxRedirects})` });
+              return;
+            }
+            const redirectUrl = resolveRedirectUrl(url, location);
+            const originalHost = new URL(url).hostname;
+            const redirectHost = new URL(redirectUrl).hostname;
+            const redirectOptions = originalHost === redirectHost
+              ? options
+              : { ...options, cookies: undefined, headers: stripCookieHeaders(options.headers) };
+            finish(await httpDownload(
+              redirectUrl,
+              destPath,
+              redirectOptions,
+              redirectCount + 1,
+            ));
+            return;
+          }
+        }
+
+        if (response.status !== 200) {
+          finish({ success: false, size: 0, error: `HTTP ${response.status}` });
           return;
         }
-        const redirectUrl = resolveRedirectUrl(url, response.headers.location);
-        const originalHost = new URL(url).hostname;
-        const redirectHost = new URL(redirectUrl).hostname;
-        // Do not forward cookies when a redirect crosses host boundaries.
-        const redirectOptions = originalHost === redirectHost
-          ? options
-          : { ...options, cookies: undefined, headers: stripCookieHeaders(options.headers) };
-        httpDownload(
-          redirectUrl,
-          destPath,
-          redirectOptions,
-          redirectCount + 1,
-        ).then(resolve);
-        return;
+
+        if (!response.body) {
+          finish({ success: false, size: 0, error: 'Empty response body' });
+          return;
+        }
+
+        const totalSize = parseInt(response.headers.get('content-length') || '0', 10);
+        let received = 0;
+        const progressStream = new Transform({
+          transform(chunk, _encoding, callback) {
+            received += chunk.length;
+            if (onProgress) onProgress(received, totalSize);
+            callback(null, chunk);
+          },
+        });
+
+        try {
+          await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+          await pipeline(
+            Readable.fromWeb(response.body as unknown as WebReadableStream),
+            progressStream,
+            fs.createWriteStream(tempPath),
+          );
+          await fs.promises.rename(tempPath, destPath);
+          finish({ success: true, size: received });
+        } catch (err) {
+          await cleanupTempFile();
+          finish({ success: false, size: 0, error: getErrorMessage(err) });
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        await cleanupTempFile();
+        finish({ success: false, size: 0, error: err instanceof Error ? err.message : String(err) });
       }
-
-      if (response.statusCode !== 200) {
-        file.close();
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-        resolve({ success: false, size: 0, error: `HTTP ${response.statusCode}` });
-        return;
-      }
-
-      const totalSize = parseInt(response.headers['content-length'] || '0', 10);
-      let received = 0;
-
-      response.on('data', (chunk: Buffer) => {
-        received += chunk.length;
-        if (onProgress) onProgress(received, totalSize);
-      });
-
-      response.pipe(file);
-
-      file.on('finish', () => {
-        file.close();
-        // Rename temp file to final destination
-        fs.renameSync(tempPath, destPath);
-        resolve({ success: true, size: received });
-      });
-    });
-
-    request.on('error', (err) => {
-      file.close();
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      resolve({ success: false, size: 0, error: err.message });
-    });
-
-    request.on('timeout', () => {
-      request.destroy();
-      file.close();
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      resolve({ success: false, size: 0, error: 'Timeout' });
-    });
+    })();
   });
 }
 

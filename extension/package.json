@@ -1,11 +1,12 @@
 {
   "name": "opencli-extension",
-  "version": "1.4.1",
+  "version": "1.5.3",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite build --watch",
     "build": "vite build",
+    "package:release": "node scripts/package-release.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

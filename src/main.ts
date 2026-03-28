@@ -20,14 +20,24 @@ import { discoverClis, discoverPlugins } from './discovery.js';
 import { getCompletions } from './completion.js';
 import { runCli } from './cli.js';
 import { emitHook } from './hooks.js';
+import { installNodeNetwork } from './node-network.js';
+import { registerUpdateNoticeOnExit, checkForUpdateBackground } from './update-check.js';
+
+installNodeNetwork();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BUILTIN_CLIS = path.resolve(__dirname, 'clis');
 const USER_CLIS = path.join(os.homedir(), '.opencli', 'clis');
 
+// Sequential: plugins must run after built-in discovery so they can override built-in commands.
 await discoverClis(BUILTIN_CLIS, USER_CLIS);
 await discoverPlugins();
+
+// Register exit hook: notice appears after command output (same as npm/gh/yarn)
+registerUpdateNoticeOnExit();
+// Kick off background fetch for next run (non-blocking)
+checkForUpdateBackground();
 
 // ── Fast-path: handle --get-completions before commander parses ─────────
 // Usage: opencli --get-completions --cursor <N> [word1 word2 ...]

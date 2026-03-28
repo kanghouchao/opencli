@@ -7,7 +7,7 @@ import { TimeoutError } from './errors.js';
  * Uses CDPBridge when OPENCLI_CDP_ENDPOINT is set, otherwise BrowserBridge.
  */
 export function getBrowserFactory(): new () => IBrowserFactory {
-  return (process.env.OPENCLI_CDP_ENDPOINT ? CDPBridge : BrowserBridge) as unknown as new () => IBrowserFactory;
+  return process.env.OPENCLI_CDP_ENDPOINT ? CDPBridge : BrowserBridge;
 }
 
 function parseEnvTimeout(envVar: string, fallback: number): number {
@@ -30,11 +30,11 @@ export const DEFAULT_BROWSER_EXPLORE_TIMEOUT = parseEnvTimeout('OPENCLI_BROWSER_
  */
 export async function runWithTimeout<T>(
   promise: Promise<T>,
-  opts: { timeout: number; label?: string },
+  opts: { timeout: number; label?: string; hint?: string },
 ): Promise<T> {
   const label = opts.label ?? 'Operation';
   return withTimeoutMs(promise, opts.timeout * 1000,
-    () => new TimeoutError(label, opts.timeout));
+    () => new TimeoutError(label, opts.timeout, opts.hint));
 }
 
 /**
